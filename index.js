@@ -1,16 +1,5 @@
-// index.js
-const { Client, GatewayIntentBits, Partials, EmbedBuilder } = require("discord.js");
+const { Client, GatewayIntentBits, EmbedBuilder } = require("discord.js");
 const fs = require("fs");
-const path = require("path");
-
-const TOKEN = process.env.TOKEN; // đặt TOKEN ở Environment variable trên Render/Host bạn dùng
-const PREFIX = "!ga";
-const JOIN_EMOJI = "🎉"; // SỬ DỤNG emoji Unicode để tránh lỗi react với emoji custom
-
-const DB_PATH = path.join(__dirname, "giveaways.json");
-if (!fs.existsSync(DB_PATH)) fs.writeFileSync(DB_PATH, "[]", "utf8");
-
-let giveaways = JSON.parse(fs.readFileSync(DB_PATH, "utf8"));
 
 const client = new Client({
   intents: [
@@ -20,21 +9,86 @@ const client = new Client({
     GatewayIntentBits.GuildMessageReactions,
     GatewayIntentBits.GuildMembers
   ],
-  partials: [Partials.Message, Partials.Channel, Partials.Reaction]
 });
 
-function saveDB() {
-  fs.writeFileSync(DB_PATH, JSON.stringify(giveaways, null, 2), "utf8");
+let giveaways = [];
+const dataFile = "giveaways.json";
+
+// Load dữ liệu
+if (fs.existsSync(dataFile)) {
+  giveaways = JSON.parse(fs.readFileSync(dataFile));
 }
 
-function msParse(str) {
-  // nhận dạng: 30s, 5m, 2h, 1d
-  if (!str) return null;
-  const m = str.match(/^(\d+)(s|m|h|d)$/);
-  if (!m) return null;
-  const n = parseInt(m[1], 10);
-  const unit = m[2];
-  if (unit === "s") return n * 1000;
+// Lưu dữ liệu
+function saveGiveaways() {
+  fs.writeFileSync(dataFile, JSON.stringify(giveaways, null, 2));
+}
+
+// Lệnh tạo giveaway: !ga <thời gian giây> <số người thắng> <giải thưởng>
+client.on("messageCreate", async (msg) => {
+  if (!msg.content.startsWith("!ga")) return;
+
+  const args = msg.content.split(" ");
+  const duration = parseInt(args[1]) * 1000;
+  const winnersCount = parseInt(args[2]);
+  const prize = args.slice(3).join(" ");
+  const endTime = Date.now() + duration;
+
+  const embed = new EmbedBuilder()
+    .setTitle("🎉 GIVEAWAY 🎉")
+    .setDescription(`Bấm ✨ để tham gia giveaway!\n\n🎁 **Giải thưởng:** ${prize}\n🏆 **Số người thắng:** ${winnersCount}\n⏰ **Còn lại:** <t:${Math.floor(endTime / 1000)}:R>`)
+    .setColor("Pink")
+    .setThumbnail(msg.author.displayAvatarURL());
+
+  const giveawayMsg = await msg.channel.send({ embeds: [embed] });
+  await giveawayMsg.react("✨");
+
+  giveaways.push({
+    messageId: giveawayMsg.id,
+    channelId: msg.channel.id,
+    prize,
+    winnersCount,
+    endTime,
+    users: []
+  });
+
+  saveGiveaways();
+});
+
+// Người dùng tham gia
+client.on("messageReactionAdd", async (reaction, user) => {
+  if (user.bot) return;
+  const giveaway = giveaways.find(g => g.messageId === reaction.message.id);
+  if (giveaway && reaction.emoji.name === "✨") {
+    if (!giveaway.users.includes(user.id)) {
+      giveaway.users.push(user.id);
+      saveGiveaways();
+    }
+  }
+});
+
+// Check winner mỗi 5s
+setInterval(async () => {
+  const now = Date.now();
+  for (const g of giveaways) {
+    if (g.endTime <= now && !g.ended) {
+      g.ended = true;
+      const channel = await client.channels.fetch(g.channelId);
+      const message = await channel.messages.fetch(g.messageId);
+      const winners = [];
+
+      for (let i = 0; i < g.winnersCount; i++) {
+        const winner = g.users[Math.floor(Math.random() * g.users.length)];
+        if (winner && !winners.includes(winner)) winners.push(winner);
+      }
+
+      channel.send(`🎉 Giveaway kết thúc!\n🏆 Người thắng: ${winners.map(w => `<@${w}>`).join(", ") || "Không có ai"}\n🎁 Giải thưởng: **${g.prize}**`);
+      saveGiveaways();
+    }
+  }
+}, 5000);
+
+client.login(process.env.DISCORD_TOKEN);  if (unit === "s") return n * 1000;
   if (unit === "m") return n * 60 * 1000;
   if (unit === "h") return n * 60 * 60 * 1000;
   if (unit === "d") return n * 24 * 60 * 60 * 1000;
