@@ -1,151 +1,124 @@
 const { Client, GatewayIntentBits, Partials } = require("discord.js");
 const fs = require("fs");
 
-// ====== Load & lưu giveaway ======
-let giveaways = [];
-const giveawaysFile = "giveaways.json";
-if (fs.existsSync(giveawaysFile)) {
-  giveaways = JSON.parse(fs.readFileSync(giveawaysFile));
-}
-function saveGiveaways() {
-  fs.writeFileSync(giveawaysFile, JSON.stringify(giveaways, null, 2));
-}
-
-// ====== Tạo client ======
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.GuildMessageReactions,
     GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMessageReactions
   ],
   partials: [Partials.Message, Partials.Channel, Partials.Reaction],
 });
 
-client.once("ready", () => {
-  console.log(`✅ Bot đã online với tên: ${client.user.tag}`);
-});
+const PREFIX = "!";
+let giveaways = [];
 
-// ====== Hàm parse thời gian (10s, 5m, 1h, 1d) ======
-function parseTime(str) {
-  const match = str.match(/(\d+)(s|m|h|d)/);
-  if (!match) return null;
-  const num = parseInt(match[1]);
-  const unit = match[2];
-  switch (unit) {
-    case "s": return num * 1000;
-    case "m": return num * 60000;
-    case "h": return num * 3600000;
-    case "d": return num * 86400000;
-    default: return null;
-  }
+// Đọc file lưu giveaway
+if (fs.existsSync("giveaways.json")) {
+  giveaways = JSON.parse(fs.readFileSync("giveaways.json", "utf8"));
 }
 
-// ====== Xử lý lệnh ======
-client.on("messageCreate", async (message) => {
-  if (message.author.bot) return;
+// Lưu file
+function saveGiveaways() {
+  fs.writeFileSync("giveaways.json", JSON.stringify(giveaways, null, 2));
+}
 
-  // Lệnh test bot
-  if (message.content === "!ping") {
+// Convert time (1m, 1h, 1d)
+function ms(time) {
+  const num = parseInt(time);
+  if (time.endsWith("s")) return num * 1000;
+  if (time.endsWith("m")) return num * 60 * 1000;
+  if (time.endsWith("h")) return num * 60 * 60 * 1000;
+  if (time.endsWith("d")) return num * 24 * 60 * 60 * 1000;
+  return num;
+}
+
+client.once("ready", () => {
+  console.log(`✅ Bot đã online: ${client.user.tag}`);
+});
+
+client.on("messageCreate", async (message) => {
+  if (!message.content.startsWith(PREFIX) || message.author.bot) return;
+  const args = message.content.slice(PREFIX.length).trim().split(/ +/);
+  const cmd = args.shift().toLowerCase();
+
+  // Ping
+  if (cmd === "ping") {
     return message.reply("🏓 Pong! Bot đang hoạt động.");
   }
 
-  // Lệnh tạo giveaway
-  if (message.content.startsWith("!ga")) {
-    const args = message.content.split(" ");
-    const duration = parseTime(args[1]);
-    const winnerCount = parseInt(args[2]);
-    const prize = args.slice(3).join(" ");
-
-    if (!duration || isNaN(winnerCount) || !prize) {
-      return message.reply("❌ Sai cú pháp!\nVí dụ: `!ga 10s 1 Nitro`");
+  // Giveaway
+  if (cmd === "ga") {
+    if (args.length < 3) {
+      return message.reply("❌ Dùng: `!ga <time> <winnerCount> <prize>`\nVD: `!ga 1m 1 Nitro`");
     }
 
+    const duration = ms(args[0]);
+    const winnerCount = parseInt(args[1]);
+    const prize = args.slice(2).join(" ");
     const endTime = Date.now() + duration;
+
     const embed = {
       title: "🎉 GIVEAWAY ĐANG DIỄN RA 🎉",
-      description: `💎 Phần thưởng: **${prize}**\n🏆 Số người thắng: **${winnerCount}**\n⏰ Thời gian: **${args[1]}**\n\n👉 React 🎉 để tham gia ngay!`,
-      color: 0xffc107, // vàng nổi bật
+      description: `💎 Phần thưởng: **${prize}**\n🏆 Số người thắng: **${winnerCount}**\n⏰ Thời gian: **${args[0]}**\n\n👉 React 🎉 để tham gia ngay!`,
+      color: 0xffc107,
       timestamp: new Date(endTime),
-      footer: { text: "Giveaway kết thúc vào" },
+      footer: { text: "Giveaway kết thúc vào" }
     };
 
-    const giveawayMsg = await message.channel.send({ embeds: [embed] });
-    await giveawayMsg.react("🎉");
+    const msg = await message.channel.send({ embeds: [embed] });
+    await msg.react("🎉");
 
     giveaways.push({
-      messageId: giveawayMsg.id,
+      messageId: msg.id,
       channelId: message.channel.id,
       prize,
       winnerCount,
-      endTime,
+      endTime
     });
     saveGiveaways();
-
-    // Hẹn giờ chọn winner
-    setTimeout(async () => {
-      try {
-        const msg = await message.channel.messages.fetch(giveawayMsg.id);
-        const reaction = msg.reactions.cache.get("🎉");
-        const users = await reaction.users.fetch();
-        const filtered = users.filter((u) => !u.bot);
-        if (filtered.size === 0) {
-          return message.channel.send(`❌ Không có ai tham gia giveaway **${prize}**`);
-        }
-        const winners = filtered.random(winnerCount);
-
-        const winEmbed = {
-          title: "🎊 GIVEAWAY KẾT THÚC 🎊",
-          description: `💎 Phần thưởng: **${prize}**\n🏆 Người thắng: ${winners.map(w => `<@${w.id}>`).join(", ")}`,
-          color: 0x2ecc71, // xanh lá
-          timestamp: new Date(),
-          footer: { text: "Chúc mừng người chiến thắng!" },
-        };
-
-        message.channel.send({ embeds: [winEmbed] });
-      } catch (err) {
-        console.error(err);
-        message.channel.send("⚠️ Có lỗi xảy ra khi kết thúc giveaway!");
-      }
-    }, duration);
   }
 
-  // Lệnh reroll
-  if (message.content.startsWith("!reroll")) {
-    const args = message.content.split(" ");
-    const messageId = args[1];
-    if (!messageId) return message.reply("❌ Bạn phải nhập ID tin nhắn giveaway để reroll!");
-
-    const giveaway = giveaways.find((g) => g.messageId === messageId);
-    if (!giveaway) return message.reply("❌ Không tìm thấy giveaway với ID này!");
+  // Reroll
+  if (cmd === "reroll") {
+    if (!args[0]) return message.reply("❌ Dùng: `!reroll <messageId>`");
+    const giveaway = giveaways.find(g => g.messageId === args[0]);
+    if (!giveaway) return message.reply("❌ Không tìm thấy giveaway!");
 
     try {
       const channel = await client.channels.fetch(giveaway.channelId);
-      const msg = await channel.messages.fetch(messageId);
+      const msg = await channel.messages.fetch(giveaway.messageId);
       const reaction = msg.reactions.cache.get("🎉");
-      if (!reaction) return message.reply("❌ Giveaway này không có ai tham gia!");
-
       const users = await reaction.users.fetch();
-      const filtered = users.filter((u) => !u.bot);
-      if (filtered.size === 0) return message.reply("❌ Không có ai tham gia hợp lệ!");
+      const validUsers = users.filter(u => !u.bot).map(u => u);
 
-      const winners = filtered.random(giveaway.winnerCount);
-      const rerollEmbed = {
-        title: "🔄 REROLL GIVEAWAY 🔄",
-        description: `💎 Phần thưởng: **${giveaway.prize}**\n🏆 Người thắng mới: ${winners.map(w => `<@${w.id}>`).join(", ")}`,
-        color: 0xe67e22, // cam
+      if (validUsers.length === 0) {
+        return message.channel.send("❌ Không có ai tham gia.");
+      }
+
+      const winners = [];
+      for (let i = 0; i < giveaway.winnerCount; i++) {
+        const winner = validUsers[Math.floor(Math.random() * validUsers.length)];
+        if (!winners.includes(winner)) winners.push(winner);
+      }
+
+      const winEmbed = {
+        title: "🎊 GIVEAWAY REROLL 🎊",
+        description: `Phần thưởng: **${giveaway.prize}**\nNgười thắng mới: ${winners.map(w => `<@${w.id}>`).join(", ")}`,
+        color: 0x3498db,
         timestamp: new Date(),
-        footer: { text: "Người thắng mới đã được chọn" },
+        footer: { text: "Chúc mừng người chiến thắng mới!" }
       };
-      message.channel.send({ embeds: [rerollEmbed] });
+      message.channel.send({ embeds: [winEmbed] });
     } catch (err) {
       console.error(err);
-      message.reply("⚠️ Có lỗi xảy ra khi reroll!");
+      message.reply("❌ Có lỗi khi reroll!");
     }
   }
 
-  // Lệnh listga
-  if (message.content === "!listga") {
+  // List giveaway
+  if (cmd === "listga") {
     if (giveaways.length === 0) {
       return message.reply("📭 Hiện tại không có giveaway nào đang chạy.");
     }
@@ -157,16 +130,55 @@ client.on("messageCreate", async (message) => {
       return `🎁 **${g.prize}** | 🏆 ${g.winnerCount} winner(s) | ⏳ còn ${seconds}s | 🆔 ${g.messageId}`;
     }).join("\n\n");
 
-    const listEmbed = {
-      title: "📋 Danh sách Giveaway đang chạy",
-      description: list,
-      color: 0x00ffcc,
-      timestamp: new Date(),
-    };
-
-    message.channel.send({ embeds: [listEmbed] });
+    message.channel.send({
+      embeds: [{
+        title: "📋 Danh sách Giveaway đang chạy",
+        description: list,
+        color: 0x00ffcc
+      }]
+    });
   }
 });
 
-// ====== Login bot ======
+// Check giveaway kết thúc
+setInterval(async () => {
+  const now = Date.now();
+  for (let i = giveaways.length - 1; i >= 0; i--) {
+    const giveaway = giveaways[i];
+    if (now >= giveaway.endTime) {
+      try {
+        const channel = await client.channels.fetch(giveaway.channelId);
+        const msg = await channel.messages.fetch(giveaway.messageId);
+        const reaction = msg.reactions.cache.get("🎉");
+        const users = await reaction.users.fetch();
+        const validUsers = users.filter(u => !u.bot).map(u => u);
+
+        let winners = [];
+        if (validUsers.length > 0) {
+          for (let j = 0; j < giveaway.winnerCount; j++) {
+            const winner = validUsers[Math.floor(Math.random() * validUsers.length)];
+            if (!winners.includes(winner)) winners.push(winner);
+          }
+        }
+
+        const winEmbed = {
+          title: "🎊 GIVEAWAY KẾT THÚC 🎊",
+          description: winners.length > 0
+            ? `Phần thưởng: **${giveaway.prize}**\nNgười thắng: ${winners.map(w => `<@${w.id}>`).join(", ")}`
+            : `Phần thưởng: **${giveaway.prize}**\n❌ Không có ai tham gia.`,
+          color: 0x2ecc71,
+          timestamp: new Date(),
+          footer: { text: "Giveaway đã kết thúc" }
+        };
+
+        channel.send({ embeds: [winEmbed] });
+      } catch (err) {
+        console.error("Lỗi khi kết thúc giveaway:", err);
+      }
+      giveaways.splice(i, 1);
+      saveGiveaways();
+    }
+  }
+}, 5000);
+
 client.login(process.env.DISCORD_TOKEN);
