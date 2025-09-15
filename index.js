@@ -1,5 +1,36 @@
-const { Client, GatewayIntentBits, Partials } = require("discord.js");
+// index.js
+const { Client, GatewayIntentBits, Partials, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require("discord.js");
 const fs = require("fs");
+const path = require("path");
+
+const TOKEN = process.env.TOKEN;
+if (!TOKEN) {
+  console.error("ERROR: Missing TOKEN environment variable. Set TOKEN in Render/Env or .env for local.");
+  process.exit(1);
+}
+
+const DATA_FILE = path.join(__dirname, "giveaways.json");
+if (!fs.existsSync(DATA_FILE)) fs.writeFileSync(DATA_FILE, "[]", "utf8");
+let giveaways = JSON.parse(fs.readFileSync(DATA_FILE, "utf8")); // array of giveaway objects
+const timers = new Map();
+
+function saveGiveaways() {
+  fs.writeFileSync(DATA_FILE, JSON.stringify(giveaways, null, 2));
+}
+
+// parse time strings like "10s", "5m", "2h", "1d"
+function parseDuration(str) {
+  if (!str) return null;
+  const m = str.match(/^(\d+)(s|m|h|d)$/);
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  const unit = m[2];
+  if (unit === "s") return n * 1000;
+  if (unit === "m") return n * 60 * 1000;
+  if (unit === "h") return n * 60 * 60 * 1000;
+  if (unit === "d") return n * 24 * 60 * 60 * 1000;
+  return null;
+}
 
 const client = new Client({
   intents: [
@@ -11,174 +42,271 @@ const client = new Client({
   partials: [Partials.Message, Partials.Channel, Partials.Reaction],
 });
 
-const PREFIX = "!";
-let giveaways = [];
-
-// Đọc file lưu giveaway
-if (fs.existsSync("giveaways.json")) {
-  giveaways = JSON.parse(fs.readFileSync("giveaways.json", "utf8"));
-}
-
-// Lưu file
-function saveGiveaways() {
-  fs.writeFileSync("giveaways.json", JSON.stringify(giveaways, null, 2));
-}
-
-// Convert time (1m, 1h, 1d)
-function ms(time) {
-  const num = parseInt(time);
-  if (time.endsWith("s")) return num * 1000;
-  if (time.endsWith("m")) return num * 60 * 1000;
-  if (time.endsWith("h")) return num * 60 * 60 * 1000;
-  if (time.endsWith("d")) return num * 24 * 60 * 60 * 1000;
-  return num;
-}
-
 client.once("ready", () => {
-  console.log(`✅ Bot đã online: ${client.user.tag}`);
+  console.log(`✅ Bot online: ${client.user.tag}`);
+  // schedule existing giveaways after restart
+  for (const g of giveaways) scheduleGiveaway(g);
 });
 
+// schedule a giveaway finish
+function scheduleGiveaway(g) {
+  const remaining = g.endTime - Date.now();
+  if (remaining <= 0) {
+    // already past due -> finish immediately
+    finishGiveaway(g);
+    return;
+  }
+  if (timers.has(g.messageId)) {
+    clearTimeout(timers.get(g.messageId));
+  }
+  const t = setTimeout(() => finishGiveaway(g), remaining);
+  timers.set(g.messageId, t);
+}
+
+// finish logic
+async function finishGiveaway(g) {
+  try {
+    const channel = await client.channels.fetch(g.channelId).catch(()=>null);
+    if (!channel) {
+      console.warn("Channel not found for giveaway", g.messageId);
+    } else {
+      const msg = await channel.messages.fetch(g.messageId).catch(()=>null);
+      // collect participants from saved list + reaction users
+      let reactionIds = [];
+      if (msg) {
+        const fetchedReactions = await msg.reactions.fetch().catch(()=>null);
+        const react = fetchedReactions ? fetchedReactions.get("🎉") : null;
+        if (react) {
+          const users = await react.users.fetch().catch(()=>null);
+          if (users) {
+            reactionIds = users.filter(u => !u.bot).map(u => u.id);
+          }
+        }
+      }
+
+      const savedIds = Array.isArray(g.participants) ? g.participants.slice() : [];
+      const allIdsSet = new Set([...savedIds, ...reactionIds]);
+      const allIds = Array.from(allIdsSet);
+
+      let winners = [];
+      if (allIds.length > 0) {
+        const pool = allIds.slice();
+        const pick = Math.min(g.winnerCount, pool.length);
+        for (let i = 0; i < pick; i++) {
+          const idx = Math.floor(Math.random() * pool.length);
+          winners.push(pool.splice(idx, 1)[0]);
+        }
+      }
+
+      const winEmbed = new EmbedBuilder()
+        .setTitle("🎊 GIVEAWAY KẾT THÚC 🎊")
+        .setColor(0x2ecc71)
+        .setTimestamp(new Date())
+        .setFooter({ text: "Giveaway đã kết thúc" });
+
+      if (winners.length > 0) {
+        winEmbed.setDescription(`💎 Phần thưởng: **${g.prize}**\n🏆 Người thắng: ${winners.map(id => `<@${id}>`).join(", ")}`);
+      } else {
+        winEmbed.setDescription(`💎 Phần thưởng: **${g.prize}**\n❌ Không có ai tham gia.`);
+      }
+
+      await channel.send({ embeds: [winEmbed] }).catch(console.error);
+    }
+  } catch (err) {
+    console.error("Error finishing giveaway:", err);
+  } finally {
+    // remove giveaway from list, save, clear timer
+    giveaways = giveaways.filter(x => x.messageId !== g.messageId);
+    saveGiveaways();
+    if (timers.has(g.messageId)) {
+      clearTimeout(timers.get(g.messageId));
+      timers.delete(g.messageId);
+    }
+  }
+}
+
+// handle commands (prefix = "!")
 client.on("messageCreate", async (message) => {
-  if (!message.content.startsWith(PREFIX) || message.author.bot) return;
-  const args = message.content.slice(PREFIX.length).trim().split(/ +/);
+  if (!message.content.startsWith("!") || message.author.bot) return;
+  const args = message.content.slice(1).trim().split(/ +/);
   const cmd = args.shift().toLowerCase();
 
-  // Ping
   if (cmd === "ping") {
-    return message.reply("🏓 Pong! Bot đang hoạt động.");
+    const uptime = process.uptime();
+    const h = Math.floor(uptime / 3600);
+    const m = Math.floor((uptime % 3600) / 60);
+    const s = Math.floor(uptime % 60);
+    return message.reply(`🏓 Pong! Ping: ${client.ws.ping}ms | Uptime: ${h}h ${m}m ${s}s`);
   }
 
-  // Giveaway
+  // !ga <time> <winners> <prize...>
   if (cmd === "ga") {
-    if (args.length < 3) {
-      return message.reply("❌ Dùng: `!ga <time> <winnerCount> <prize>`\nVD: `!ga 1m 1 Nitro`");
+    if (!message.member.permissions.has("ManageMessages") && !message.member.permissions.has("Administrator")) {
+      return message.reply("❌ Bạn cần quyền Manage Messages hoặc Administrator để tạo giveaway.");
     }
 
-    const duration = ms(args[0]);
-    const winnerCount = parseInt(args[1]);
+    if (args.length < 3) {
+      return message.reply("❌ Sai cú pháp!\nVí dụ: `!ga 1m 2 Nitro` (1m = 1 phút, s/m/h/d)");
+    }
+
+    const timeStr = args[0];
+    const duration = parseDuration(timeStr);
+    const winnerCount = parseInt(args[1], 10);
     const prize = args.slice(2).join(" ");
+    if (!duration || isNaN(winnerCount) || !prize) {
+      return message.reply("❌ Thời gian/ số người/ giải thưởng không hợp lệ.");
+    }
+
     const endTime = Date.now() + duration;
+    const embed = new EmbedBuilder()
+      .setTitle("🎉 GIVEAWAY ĐANG DIỄN RA 🎉")
+      .setColor(0xffc107)
+      .addFields(
+        { name: "💎 Giải thưởng", value: prize, inline: true },
+        { name: "🏆 Số người thắng", value: `${winnerCount}`, inline: true },
+        { name: "⏰ Kết thúc", value: `<t:${Math.floor(endTime/1000)}:F> (\`<t:${Math.floor(endTime/1000)}:R>\`)`, inline: false }
+      )
+      .setFooter({ text: `Tạo bởi ${message.author.tag}` });
 
-    const embed = {
-      title: "🎉 GIVEAWAY ĐANG DIỄN RA 🎉",
-      description: `💎 Phần thưởng: **${prize}**\n🏆 Số người thắng: **${winnerCount}**\n⏰ Thời gian: **${args[0]}**\n\n👉 React 🎉 để tham gia ngay!`,
-      color: 0xffc107,
-      timestamp: new Date(endTime),
-      footer: { text: "Giveaway kết thúc vào" }
-    };
+    const button = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId("join_giveaway_TEMP") // will replace after sending (we need message id)
+        .setLabel("🎉 Tham gia")
+        .setStyle(ButtonStyle.Primary)
+    );
 
-    const msg = await message.channel.send({ embeds: [embed] });
-    await msg.react("🎉");
+    const sent = await message.channel.send({ embeds: [embed], components: [button] });
+    // set unique customId with message id so each button is unique
+    const customId = `join_giveaway_${sent.id}`;
+    // edit message to set correct customId
+    const updatedRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(customId)
+        .setLabel("🎉 Tham gia")
+        .setStyle(ButtonStyle.Primary)
+    );
+    await sent.edit({ components: [updatedRow] }).catch(()=>{});
 
-    giveaways.push({
-      messageId: msg.id,
+    // react too (for users who prefer reaction)
+    await sent.react("🎉").catch(()=>{});
+
+    const newG = {
+      messageId: sent.id,
       channelId: message.channel.id,
       prize,
       winnerCount,
-      endTime
-    });
+      endTime,
+      participants: [] // store user ids who used button / join list
+    };
+    giveaways.push(newG);
     saveGiveaways();
+    scheduleGiveaway(newG);
+
+    return message.reply(`✅ Giveaway đã tạo: **${prize}** | Kết thúc: <t:${Math.floor(endTime/1000)}:F>`);
   }
 
-  // Reroll
+  // !listga
+  if (cmd === "listga") {
+    if (!giveaways.length) return message.reply("📭 Hiện không có giveaway nào đang chạy.");
+    const now = Date.now();
+    const lines = giveaways.map(g => {
+      const rem = Math.max(0, Math.floor((g.endTime - now)/1000));
+      return `🎁 **${g.prize}** | 🏆 ${g.winnerCount} | ⏳ còn ${rem}s | 🆔 ${g.messageId}`;
+    }).join("\n\n");
+    return message.channel.send({ embeds: [ new EmbedBuilder().setTitle("📋 Giveaway đang chạy").setDescription(lines).setColor(0x00ffcc) ] });
+  }
+
+  // !reroll <messageId>
   if (cmd === "reroll") {
-    if (!args[0]) return message.reply("❌ Dùng: `!reroll <messageId>`");
-    const giveaway = giveaways.find(g => g.messageId === args[0]);
-    if (!giveaway) return message.reply("❌ Không tìm thấy giveaway!");
-
+    if (!message.member.permissions.has("ManageMessages") && !message.member.permissions.has("Administrator")) {
+      return message.reply("❌ Bạn cần quyền Manage Messages hoặc Administrator để reroll.");
+    }
+    const id = args[0];
+    if (!id) return message.reply("❌ Dùng: `!reroll <messageId>`");
+    const g = giveaways.find(x => x.messageId === id);
+    if (!g) return message.reply("❌ Không tìm thấy giveaway với ID này.");
     try {
-      const channel = await client.channels.fetch(giveaway.channelId);
-      const msg = await channel.messages.fetch(giveaway.messageId);
-      const reaction = msg.reactions.cache.get("🎉");
-      const users = await reaction.users.fetch();
-      const validUsers = users.filter(u => !u.bot).map(u => u);
-
-      if (validUsers.length === 0) {
-        return message.channel.send("❌ Không có ai tham gia.");
+      const channel = await client.channels.fetch(g.channelId);
+      const msg = await channel.messages.fetch(g.messageId);
+      const react = (await msg.reactions.fetch()).get("🎉");
+      let reactionIds = [];
+      if (react) {
+        const users = await react.users.fetch();
+        reactionIds = users.filter(u => !u.bot).map(u => u.id);
       }
-
+      const allIds = Array.from(new Set([...(g.participants||[]), ...reactionIds]));
+      if (!allIds.length) return message.reply("❌ Không có ai tham gia để reroll.");
       const winners = [];
-      for (let i = 0; i < giveaway.winnerCount; i++) {
-        const winner = validUsers[Math.floor(Math.random() * validUsers.length)];
-        if (!winners.includes(winner)) winners.push(winner);
+      const pool = allIds.slice();
+      const pick = Math.min(g.winnerCount, pool.length);
+      for (let i=0;i<pick;i++){
+        const idx = Math.floor(Math.random()*pool.length);
+        winners.push(pool.splice(idx,1)[0]);
       }
-
-      const winEmbed = {
-        title: "🎊 GIVEAWAY REROLL 🎊",
-        description: `Phần thưởng: **${giveaway.prize}**\nNgười thắng mới: ${winners.map(w => `<@${w.id}>`).join(", ")}`,
-        color: 0x3498db,
-        timestamp: new Date(),
-        footer: { text: "Chúc mừng người chiến thắng mới!" }
-      };
-      message.channel.send({ embeds: [winEmbed] });
+      return message.channel.send({ embeds: [ new EmbedBuilder().setTitle("🔁 Reroll Giveaway").setDescription(`Phần thưởng: **${g.prize}**\nNgười thắng mới: ${winners.map(id=>`<@${id}>`).join(", ")}`).setColor(0xe67e22) ] });
     } catch (err) {
       console.error(err);
-      message.reply("❌ Có lỗi khi reroll!");
+      return message.reply("❌ Lỗi khi reroll.");
     }
   }
 
-  // List giveaway
-  if (cmd === "listga") {
-    if (giveaways.length === 0) {
-      return message.reply("📭 Hiện tại không có giveaway nào đang chạy.");
+  // !endga <messageId>  -> kết thúc ngay
+  if (cmd === "endga") {
+    if (!message.member.permissions.has("ManageMessages") && !message.member.permissions.has("Administrator")) {
+      return message.reply("❌ Bạn cần quyền Manage Messages hoặc Administrator để end giveaway.");
     }
-
-    const now = Date.now();
-    const list = giveaways.map(g => {
-      const remaining = g.endTime - now;
-      const seconds = Math.max(0, Math.floor(remaining / 1000));
-      return `🎁 **${g.prize}** | 🏆 ${g.winnerCount} winner(s) | ⏳ còn ${seconds}s | 🆔 ${g.messageId}`;
-    }).join("\n\n");
-
-    message.channel.send({
-      embeds: [{
-        title: "📋 Danh sách Giveaway đang chạy",
-        description: list,
-        color: 0x00ffcc
-      }]
-    });
+    const id = args[0];
+    if (!id) return message.reply("❌ Dùng: `!endga <messageId>`");
+    const g = giveaways.find(x => x.messageId === id);
+    if (!g) return message.reply("❌ Không tìm thấy giveaway.");
+    g.endTime = Date.now();
+    saveGiveaways();
+    scheduleGiveaway(g); // scheduling will notice endTime <= now and finish immediately
+    return message.reply(`✅ Giveaway ${id} đã được đặt để kết thúc ngay.`);
   }
 });
 
-// Check giveaway kết thúc
-setInterval(async () => {
-  const now = Date.now();
-  for (let i = giveaways.length - 1; i >= 0; i--) {
-    const giveaway = giveaways[i];
-    if (now >= giveaway.endTime) {
-      try {
-        const channel = await client.channels.fetch(giveaway.channelId);
-        const msg = await channel.messages.fetch(giveaway.messageId);
-        const reaction = msg.reactions.cache.get("🎉");
-        const users = await reaction.users.fetch();
-        const validUsers = users.filter(u => !u.bot).map(u => u);
+// handle button clicks (join)
+client.on("interactionCreate", async (interaction) => {
+  try {
+    if (!interaction.isButton()) return;
+    const customId = interaction.customId;
+    if (!customId.startsWith("join_giveaway_")) return;
+    const messageId = customId.replace("join_giveaway_", "");
+    const g = giveaways.find(x => x.messageId === messageId);
+    if (!g) return interaction.reply({ content: "❌ Giveaway không tồn tại hoặc đã kết thúc.", ephemeral: true });
 
-        let winners = [];
-        if (validUsers.length > 0) {
-          for (let j = 0; j < giveaway.winnerCount; j++) {
-            const winner = validUsers[Math.floor(Math.random() * validUsers.length)];
-            if (!winners.includes(winner)) winners.push(winner);
-          }
-        }
+    const userId = interaction.user.id;
+    if (!g.participants) g.participants = [];
+    if (!g.participants.includes(userId)) {
+      g.participants.push(userId);
+      saveGiveaways();
+      await interaction.reply({ content: "✅ Bạn đã tham gia giveaway!", ephemeral: true });
+    } else {
+      await interaction.reply({ content: "ℹ️ Bạn đã tham gia rồi.", ephemeral: true });
+    }
+  } catch (err) {
+    console.error("interactionCreate error:", err);
+  }
+});
 
-        const winEmbed = {
-          title: "🎊 GIVEAWAY KẾT THÚC 🎊",
-          description: winners.length > 0
-            ? `Phần thưởng: **${giveaway.prize}**\nNgười thắng: ${winners.map(w => `<@${w.id}>`).join(", ")}`
-            : `Phần thưởng: **${giveaway.prize}**\n❌ Không có ai tham gia.`,
-          color: 0x2ecc71,
-          timestamp: new Date(),
-          footer: { text: "Giveaway đã kết thúc" }
-        };
-
-        channel.send({ embeds: [winEmbed] });
-      } catch (err) {
-        console.error("Lỗi khi kết thúc giveaway:", err);
-      }
-      giveaways.splice(i, 1);
+// handle reaction add (join by reaction)
+client.on("messageReactionAdd", async (reaction, user) => {
+  if (user.bot) return;
+  try {
+    if (reaction.partial) await reaction.fetch();
+    if (reaction.message && reaction.message.partial) await reaction.message.fetch();
+    if (reaction.emoji && reaction.emoji.name !== "🎉") return;
+    const g = giveaways.find(x => x.messageId === reaction.message.id);
+    if (!g) return;
+    if (!g.participants) g.participants = [];
+    if (!g.participants.includes(user.id)) {
+      g.participants.push(user.id);
       saveGiveaways();
     }
+  } catch (err) {
+    console.error("messageReactionAdd error:", err);
   }
-}, 5000);
+});
 
-client.login(process.env.DISCORD_TOKEN);
+client.login(TOKEN);
